@@ -5,7 +5,13 @@ import { CronExpressionParser } from 'cron-parser';
 
 import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
 import { AvailableGroup } from './container-runner.js';
-import { createTask, deleteTask, getTaskById, updateTask, searchConversations } from './db.js';
+import {
+  createTask,
+  deleteTask,
+  getTaskById,
+  updateTask,
+  searchConversations,
+} from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
@@ -147,8 +153,16 @@ export function startIpcWatcher(deps: IpcDeps): void {
       }
 
       // Process session search requests from this group's IPC directory
-      const searchRequestsDir = path.join(ipcBaseDir, sourceGroup, 'search-requests');
-      const searchResponsesDir = path.join(ipcBaseDir, sourceGroup, 'search-responses');
+      const searchRequestsDir = path.join(
+        ipcBaseDir,
+        sourceGroup,
+        'search-requests',
+      );
+      const searchResponsesDir = path.join(
+        ipcBaseDir,
+        sourceGroup,
+        'search-responses',
+      );
 
       try {
         if (fs.existsSync(searchRequestsDir)) {
@@ -165,10 +179,18 @@ export function startIpcWatcher(deps: IpcDeps): void {
             try {
               const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
 
-              if (data.type === 'session_search' && data.request_id && data.query) {
+              if (
+                data.type === 'session_search' &&
+                data.request_id &&
+                data.query
+              ) {
                 // Perform search
                 const limit = data.limit || 3;
-                const results = searchConversations(sourceGroup, data.query, limit);
+                const results = searchConversations(
+                  sourceGroup,
+                  data.query,
+                  limit,
+                );
 
                 // Write response
                 const responseData = {
@@ -179,12 +201,15 @@ export function startIpcWatcher(deps: IpcDeps): void {
 
                 const responsePath = path.join(
                   searchResponsesDir,
-                  `${data.request_id}.json`
+                  `${data.request_id}.json`,
                 );
 
                 // Atomic write
                 const tempPath = `${responsePath}.tmp`;
-                fs.writeFileSync(tempPath, JSON.stringify(responseData, null, 2));
+                fs.writeFileSync(
+                  tempPath,
+                  JSON.stringify(responseData, null, 2),
+                );
                 fs.renameSync(tempPath, responsePath);
 
                 logger.info(
@@ -194,7 +219,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
                     query: data.query,
                     resultCount: results.length,
                   },
-                  'Session search completed via IPC'
+                  'Session search completed via IPC',
                 );
               }
 
@@ -205,25 +230,28 @@ export function startIpcWatcher(deps: IpcDeps): void {
               if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
                 logger.debug(
                   { file, sourceGroup },
-                  'Search request file disappeared before processing'
+                  'Search request file disappeared before processing',
                 );
                 continue;
               }
               logger.error(
                 { file, sourceGroup, err },
-                'Error processing session search request'
+                'Error processing session search request',
               );
               const errorDir = path.join(ipcBaseDir, 'errors');
               fs.mkdirSync(errorDir, { recursive: true });
               fs.renameSync(
                 filePath,
-                path.join(errorDir, `${sourceGroup}-${file}`)
+                path.join(errorDir, `${sourceGroup}-${file}`),
               );
             }
           }
         }
       } catch (err) {
-        logger.error({ err, sourceGroup }, 'Error reading search requests directory');
+        logger.error(
+          { err, sourceGroup },
+          'Error reading search requests directory',
+        );
       }
     }
 

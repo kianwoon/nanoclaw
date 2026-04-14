@@ -5,6 +5,7 @@
 import { execSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
+import path from 'path';
 
 import { logger } from './logger.js';
 
@@ -36,13 +37,50 @@ function detectHostGateway(): string {
  * for Apple Container because bridge100 only exists while containers run,
  * but the proxy must start before any container.
  * The /convert-to-apple-container skill sets this during setup.
+ * Lazy-init to avoid reading .env at module import time (breaks under launchd).
  */
-export const PROXY_BIND_HOST = process.env.CREDENTIAL_PROXY_HOST;
-if (!PROXY_BIND_HOST) {
-  throw new Error(
-    'CREDENTIAL_PROXY_HOST is not set in .env. Run /convert-to-apple-container to configure.',
-  );
+let _proxyBindHost: string | undefined;
+export function getProxyBindHost(): string {
+  if (_proxyBindHost !== undefined) return _proxyBindHost;
+  // Check process.env first (for direct `npm run dev` usage)
+  _proxyBindHost = process.env.CREDENTIAL_PROXY_HOST;
+  if (!_proxyBindHost) {
+    // Fall back to reading .env file directly (for launchd where .env isn't sourced)
+    try {
+      const envPath = path.join(process.cwd(), '.env');
+      const content = fs.readFileSync(envPath, 'utf-8');
+      for (const line of content.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) continue;
+        const eqIdx = trimmed.indexOf('=');
+        if (eqIdx === -1) continue;
+        const key = trimmed.slice(0, eqIdx).trim();
+        if (key === 'CREDENTIAL_PROXY_HOST') {
+          let value = trimmed.slice(eqIdx + 1).trim();
+          if (
+            value.length >= 2 &&
+            ((value.startsWith('"') && value.endsWith('"')) ||
+              (value.startsWith("'") && value.endsWith("'")))
+          ) {
+            value = value.slice(1, -1);
+          }
+          _proxyBindHost = value;
+          break;
+        }
+      }
+    } catch {
+      // .env not readable
+    }
+  }
+  if (!_proxyBindHost) {
+    throw new Error(
+      'CREDENTIAL_PROXY_HOST is not set in .env. Run /convert-to-apple-container to configure.',
+    );
+  }
+  return _proxyBindHost;
 }
+/** @deprecated Use getProxyBindHost() instead — required for launchd compat */
+export const PROXY_BIND_HOST = process.env.CREDENTIAL_PROXY_HOST || '';
 
 /** CLI args needed for the container to resolve the host gateway. */
 export function hostGatewayArgs(): string[] {

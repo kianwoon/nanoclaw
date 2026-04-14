@@ -10,5 +10,5 @@
 // telegram
 import './telegram.js';
 
-// whatsapp
-import './whatsapp.js';
+// whatsapp (temporarily disabled — re-enable with /add-whatsapp)
+// import './whatsapp.js';

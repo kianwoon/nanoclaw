@@ -177,15 +177,11 @@ function createSchema(database: Database.Database): void {
 
   // Add reply context columns if they don't exist (migration for existing DBs)
   try {
-    database.exec(
-      `ALTER TABLE messages ADD COLUMN reply_to_message_id TEXT`,
-    );
+    database.exec(`ALTER TABLE messages ADD COLUMN reply_to_message_id TEXT`);
     database.exec(
       `ALTER TABLE messages ADD COLUMN reply_to_message_content TEXT`,
     );
-    database.exec(
-      `ALTER TABLE messages ADD COLUMN reply_to_sender_name TEXT`,
-    );
+    database.exec(`ALTER TABLE messages ADD COLUMN reply_to_sender_name TEXT`);
   } catch {
     /* columns already exist */
   }
@@ -746,7 +742,10 @@ export interface ConversationSearchResult {
  */
 export function indexConversations(groupFolder: string): number {
   if (!isValidGroupFolder(groupFolder)) {
-    logger.warn({ groupFolder }, 'Invalid group folder for conversation indexing');
+    logger.warn(
+      { groupFolder },
+      'Invalid group folder for conversation indexing',
+    );
     return 0;
   }
 
@@ -761,15 +760,15 @@ export function indexConversations(groupFolder: string): number {
   const indexedAt = Date.now() / 1000; // Unix timestamp
 
   try {
-    const files = fs.readdirSync(conversationsDir).filter((f) =>
-      f.endsWith('.md')
-    );
+    const files = fs
+      .readdirSync(conversationsDir)
+      .filter((f) => f.endsWith('.md'));
 
     // Use INSERT OR REPLACE to update files that have been modified
     // The UNIQUE(group_folder, filename) constraint handles upserts
     const upsertStmt = db.prepare(
       `INSERT OR REPLACE INTO conversations (group_folder, filename, date, content, indexed_at, file_mtime)
-       VALUES (?, ?, ?, ?, ?, ?)`
+       VALUES (?, ?, ?, ?, ?, ?)`,
     );
 
     for (const filename of files) {
@@ -783,7 +782,14 @@ export function indexConversations(groupFolder: string): number {
         const dateMatch = filename.match(/^(\d{4}-\d{2}-\d{2})/);
         const date = dateMatch ? dateMatch[1] : null;
 
-        const result = upsertStmt.run(groupFolder, filename, date, content, indexedAt, fileMtime);
+        const result = upsertStmt.run(
+          groupFolder,
+          filename,
+          date,
+          content,
+          indexedAt,
+          fileMtime,
+        );
 
         // Only count if this was a new insert or an update (changes > 0)
         // changes = 0 means the row was identical and REPLACE did nothing
@@ -793,7 +799,7 @@ export function indexConversations(groupFolder: string): number {
       } catch (err) {
         logger.warn(
           { groupFolder, filename, err },
-          'Failed to index conversation file'
+          'Failed to index conversation file',
         );
       }
     }
@@ -801,11 +807,14 @@ export function indexConversations(groupFolder: string): number {
     if (indexedCount > 0) {
       logger.info(
         { groupFolder, indexedCount, totalFiles: files.length },
-        'Conversation indexing complete'
+        'Conversation indexing complete',
       );
     }
   } catch (err) {
-    logger.error({ groupFolder, err }, 'Failed to scan conversations directory');
+    logger.error(
+      { groupFolder, err },
+      'Failed to scan conversations directory',
+    );
   }
 
   return indexedCount;
@@ -821,7 +830,10 @@ export function searchConversations(
   limit: number = 3,
 ): ConversationSearchResult[] {
   if (!isValidGroupFolder(groupFolder)) {
-    logger.warn({ groupFolder }, 'Invalid group folder for conversation search');
+    logger.warn(
+      { groupFolder },
+      'Invalid group folder for conversation search',
+    );
     return [];
   }
 
@@ -845,13 +857,11 @@ export function searchConversations(
       LIMIT ?
     `;
 
-    const rows = db
-      .prepare(sql)
-      .all(groupFolder, query, limit) as Array<{
-        filename: string;
-        date: string | null;
-        snippet: string;
-      }>;
+    const rows = db.prepare(sql).all(groupFolder, query, limit) as Array<{
+      filename: string;
+      date: string | null;
+      snippet: string;
+    }>;
 
     // Clean up snippet: remove FTS5 markup tags
     return rows.map((row) => ({

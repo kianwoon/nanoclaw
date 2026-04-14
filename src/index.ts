@@ -5,6 +5,7 @@ import { OneCLI } from '@onecli-sh/sdk';
 
 import {
   ASSISTANT_NAME,
+  CREDENTIAL_PROXY_PORT,
   DEFAULT_TRIGGER,
   getTriggerPattern,
   GROUPS_DIR,
@@ -14,6 +15,7 @@ import {
   POLL_INTERVAL,
   TIMEZONE,
 } from './config.js';
+import { startCredentialProxy } from './credential-proxy.js';
 import './channels/index.js';
 import {
   getChannelFactory,
@@ -28,6 +30,7 @@ import {
 import {
   cleanupOrphans,
   ensureContainerRuntimeRunning,
+  getProxyBindHost,
 } from './container-runtime.js';
 import {
   getAllChats,
@@ -578,6 +581,11 @@ function ensureContainerSystemRunning(): void {
 
 async function main(): Promise<void> {
   ensureContainerSystemRunning();
+
+  // Start credential proxy before anything else — containers need it to reach the LLM API
+  startCredentialProxy(CREDENTIAL_PROXY_PORT, getProxyBindHost());
+  logger.info({ port: CREDENTIAL_PROXY_PORT, host: getProxyBindHost() }, 'Credential proxy started');
+
   initDatabase();
   logger.info('Database initialized');
   loadState();

@@ -151,7 +151,13 @@ export class WhatsAppChannel implements Channel {
         exec(
           `osascript -e 'display notification "${msg}" with title "NanoClaw" sound name "Basso"'`,
         );
-        setTimeout(() => process.exit(1), 1000);
+        // Don't exit - other channels may still be running.
+        // Reject the connect() promise so main() can skip this channel
+        // and continue with other channels (e.g. Telegram).
+        if (this.pendingFirstOpen) {
+          this.pendingFirstOpen();
+          this.pendingFirstOpen = undefined;
+        }
       }
 
       if (connection === 'close') {
@@ -180,8 +186,15 @@ export class WhatsAppChannel implements Channel {
             }, 5000);
           });
         } else {
-          logger.info('Logged out. Run /setup to re-authenticate.');
-          process.exit(0);
+          logger.info('WhatsApp logged out. Use /setup to re-authenticate later.');
+          this.connected = false;
+          // Don't exit - other channels (e.g. Telegram) may still be running.
+          // Reject the connect() promise so main() can skip this channel
+          // and continue with other channels.
+          if (this.pendingFirstOpen) {
+            this.pendingFirstOpen();
+            this.pendingFirstOpen = undefined;
+          }
         }
       } else if (connection === 'open') {
         this.connected = true;
@@ -232,7 +245,8 @@ export class WhatsAppChannel implements Channel {
 
     this.sock.ev.on('creds.update', saveCreds);
 
-    this.sock.ev.on('chats.phoneNumberShare', ({ lid, jid }) => {
+    // @ts-expect-error phoneNumberShare event may not be in Baileys types yet
+    this.sock.ev.on('chats.phoneNumberShare', ({ lid, jid }: { lid?: string; jid?: string }) => {
       const lidUser = lid?.split('@')[0].split(':')[0];
       if (lidUser && jid) {
         this.setLidPhoneMapping(lidUser, jid);

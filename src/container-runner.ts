@@ -293,13 +293,13 @@ export async function runContainerAgent(
     if (indexedCount > 0) {
       logger.debug(
         { group: group.name, folder: group.folder, indexedCount },
-        'Conversation indexing complete before agent spawn'
+        'Conversation indexing complete before agent spawn',
       );
     }
   } catch (err) {
     logger.warn(
       { group: group.name, folder: group.folder, err },
-      'Conversation indexing failed (non-critical, proceeding with agent spawn)'
+      'Conversation indexing failed (non-critical, proceeding with agent spawn)',
     );
   }
 
