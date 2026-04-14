@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
 
-import { ASSISTANT_NAME, DATA_DIR, STORE_DIR } from './config.js';
+import { ASSISTANT_NAME, DATA_DIR, GROUPS_DIR, STORE_DIR } from './config.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import {
@@ -82,6 +82,34 @@ function createSchema(database: Database.Database): void {
       container_config TEXT,
       requires_trigger INTEGER DEFAULT 1
     );
+
+    CREATE TABLE IF NOT EXISTS conversations (
+      id INTEGER PRIMARY KEY,
+      group_folder TEXT NOT NULL,
+      filename TEXT NOT NULL,
+      date TEXT,
+      content TEXT NOT NULL,
+      indexed_at REAL NOT NULL,
+      file_mtime REAL NOT NULL,
+      UNIQUE(group_folder, filename)
+    );
+
+    CREATE VIRTUAL TABLE IF NOT EXISTS conversations_fts USING fts5(
+      content,
+      content=conversations,
+      content_rowid=id
+    );
+
+    CREATE TRIGGER IF NOT EXISTS conversations_ai AFTER INSERT ON conversations BEGIN
+      INSERT INTO conversations_fts(rowid, content) VALUES (new.id, new.content);
+    END;
+    CREATE TRIGGER IF NOT EXISTS conversations_au AFTER UPDATE ON conversations BEGIN
+      INSERT INTO conversations_fts(conversations_fts, rowid, content) VALUES('delete', old.id, old.content);
+      INSERT INTO conversations_fts(rowid, content) VALUES (new.id, new.content);
+    END;
+    CREATE TRIGGER IF NOT EXISTS conversations_ad AFTER DELETE ON conversations BEGIN
+      INSERT INTO conversations_fts(conversations_fts, rowid, content) VALUES('delete', old.id, old.content);
+    END;
   `);
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
@@ -89,6 +117,13 @@ function createSchema(database: Database.Database): void {
     database.exec(
       `ALTER TABLE scheduled_tasks ADD COLUMN context_mode TEXT DEFAULT 'isolated'`,
     );
+  } catch {
+    /* column already exists */
+  }
+
+  // Add script column if it doesn't exist (migration for existing DBs)
+  try {
+    database.exec(`ALTER TABLE scheduled_tasks ADD COLUMN script TEXT`);
   } catch {
     /* column already exists */
   }
@@ -134,8 +169,19 @@ function createSchema(database: Database.Database): void {
       `UPDATE chats SET channel = 'discord', is_group = 1 WHERE jid LIKE 'dc:%'`,
     );
     database.exec(
-      `UPDATE chats SET channel = 'telegram', is_group = 1 WHERE jid LIKE 'tg:%'`,
+      `UPDATE chats SET channel = 'telegram', is_group = 0 WHERE jid LIKE 'tg:%'`,
     );
+  } catch {
+    /* columns already exist */
+  }
+
+  // Add reply context columns if they don't exist (migration for existing DBs)
+  try {
+    database.exec(`ALTER TABLE messages ADD COLUMN reply_to_message_id TEXT`);
+    database.exec(
+      `ALTER TABLE messages ADD COLUMN reply_to_message_content TEXT`,
+    );
+    database.exec(`ALTER TABLE messages ADD COLUMN reply_to_sender_name TEXT`);
   } catch {
     /* columns already exist */
   }
@@ -156,6 +202,11 @@ export function initDatabase(): void {
 export function _initTestDatabase(): void {
   db = new Database(':memory:');
   createSchema(db);
+}
+
+/** @internal - for tests only. */
+export function _closeDatabase(): void {
+  db.close();
 }
 
 /**
@@ -262,7 +313,7 @@ export function setLastGroupSync(): void {
  */
 export function storeMessage(msg: NewMessage): void {
   db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message, reply_to_message_id, reply_to_message_content, reply_to_sender_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     msg.id,
     msg.chat_jid,
@@ -272,6 +323,9 @@ export function storeMessage(msg: NewMessage): void {
     msg.timestamp,
     msg.is_from_me ? 1 : 0,
     msg.is_bot_message ? 1 : 0,
+    msg.reply_to_message_id ?? null,
+    msg.reply_to_message_content ?? null,
+    msg.reply_to_sender_name ?? null,
   );
 }
 
@@ -316,7 +370,8 @@ export function getNewMessages(
   // Subquery takes the N most recent, outer query re-sorts chronologically.
   const sql = `
     SELECT * FROM (
-      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
+      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me,
+             reply_to_message_id, reply_to_message_content, reply_to_sender_name
       FROM messages
       WHERE timestamp > ? AND chat_jid IN (${placeholders})
         AND is_bot_message = 0 AND content NOT LIKE ?
@@ -349,7 +404,8 @@ export function getMessagesSince(
   // Subquery takes the N most recent, outer query re-sorts chronologically.
   const sql = `
     SELECT * FROM (
-      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
+      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me,
+             reply_to_message_id, reply_to_message_content, reply_to_sender_name
       FROM messages
       WHERE chat_jid = ? AND timestamp > ?
         AND is_bot_message = 0 AND content NOT LIKE ?
@@ -363,19 +419,43 @@ export function getMessagesSince(
     .all(chatJid, sinceTimestamp, `${botPrefix}:%`, limit) as NewMessage[];
 }
 
+export function getLastBotMessageTimestamp(
+  chatJid: string,
+  botPrefix: string,
+): string | undefined {
+  const row = db
+    .prepare(
+      `SELECT MAX(timestamp) as ts FROM messages
+       WHERE chat_jid = ? AND (is_bot_message = 1 OR content LIKE ?)`,
+    )
+    .get(chatJid, `${botPrefix}:%`) as { ts: string | null } | undefined;
+  return row?.ts ?? undefined;
+}
+
+export function getMessageContentById(
+  id: string,
+  chatJid: string,
+): string | undefined {
+  const row = db
+    .prepare(`SELECT content FROM messages WHERE id = ? AND chat_jid = ?`)
+    .get(id, chatJid) as { content: string } | undefined;
+  return row?.content;
+}
+
 export function createTask(
   task: Omit<ScheduledTask, 'last_run' | 'last_result'>,
 ): void {
   db.prepare(
     `
-    INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, schedule_type, schedule_value, context_mode, next_run, status, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, script, schedule_type, schedule_value, context_mode, next_run, status, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `,
   ).run(
     task.id,
     task.group_folder,
     task.chat_jid,
     task.prompt,
+    task.script || null,
     task.schedule_type,
     task.schedule_value,
     task.context_mode || 'isolated',
@@ -410,7 +490,12 @@ export function updateTask(
   updates: Partial<
     Pick<
       ScheduledTask,
-      'prompt' | 'schedule_type' | 'schedule_value' | 'next_run' | 'status'
+      | 'prompt'
+      | 'script'
+      | 'schedule_type'
+      | 'schedule_value'
+      | 'next_run'
+      | 'status'
     >
   >,
 ): void {
@@ -420,6 +505,10 @@ export function updateTask(
   if (updates.prompt !== undefined) {
     fields.push('prompt = ?');
     values.push(updates.prompt);
+  }
+  if (updates.script !== undefined) {
+    fields.push('script = ?');
+    values.push(updates.script || null);
   }
   if (updates.schedule_type !== undefined) {
     fields.push('schedule_type = ?');
@@ -524,6 +613,10 @@ export function setSession(groupFolder: string, sessionId: string): void {
   db.prepare(
     'INSERT OR REPLACE INTO sessions (group_folder, session_id) VALUES (?, ?)',
   ).run(groupFolder, sessionId);
+}
+
+export function deleteSession(groupFolder: string): void {
+  db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(groupFolder);
 }
 
 export function getAllSessions(): Record<string, string> {
@@ -632,6 +725,154 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
     };
   }
   return result;
+}
+
+// --- Conversation search (FTS5) ---
+
+export interface ConversationSearchResult {
+  filename: string;
+  date: string | null;
+  snippet: string;
+}
+
+/**
+ * Index conversation files for a group into the FTS5 search table.
+ * Scans groups/{folder}/conversations/*.md and indexes/updates entries.
+ * Tracks file mtime to re-index modified files automatically.
+ */
+export function indexConversations(groupFolder: string): number {
+  if (!isValidGroupFolder(groupFolder)) {
+    logger.warn(
+      { groupFolder },
+      'Invalid group folder for conversation indexing',
+    );
+    return 0;
+  }
+
+  const conversationsDir = path.join(GROUPS_DIR, groupFolder, 'conversations');
+
+  if (!fs.existsSync(conversationsDir)) {
+    // No conversations directory yet, that's fine
+    return 0;
+  }
+
+  let indexedCount = 0;
+  const indexedAt = Date.now() / 1000; // Unix timestamp
+
+  try {
+    const files = fs
+      .readdirSync(conversationsDir)
+      .filter((f) => f.endsWith('.md'));
+
+    // Use INSERT OR REPLACE to update files that have been modified
+    // The UNIQUE(group_folder, filename) constraint handles upserts
+    const upsertStmt = db.prepare(
+      `INSERT OR REPLACE INTO conversations (group_folder, filename, date, content, indexed_at, file_mtime)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    );
+
+    for (const filename of files) {
+      const filePath = path.join(conversationsDir, filename);
+      try {
+        const content = fs.readFileSync(filePath, 'utf-8');
+        const stats = fs.statSync(filePath);
+        const fileMtime = stats.mtimeMs;
+
+        // Extract date from filename pattern: YYYY-MM-DD-*.md
+        const dateMatch = filename.match(/^(\d{4}-\d{2}-\d{2})/);
+        const date = dateMatch ? dateMatch[1] : null;
+
+        const result = upsertStmt.run(
+          groupFolder,
+          filename,
+          date,
+          content,
+          indexedAt,
+          fileMtime,
+        );
+
+        // Only count if this was a new insert or an update (changes > 0)
+        // changes = 0 means the row was identical and REPLACE did nothing
+        if (result.changes > 0) {
+          indexedCount++;
+        }
+      } catch (err) {
+        logger.warn(
+          { groupFolder, filename, err },
+          'Failed to index conversation file',
+        );
+      }
+    }
+
+    if (indexedCount > 0) {
+      logger.info(
+        { groupFolder, indexedCount, totalFiles: files.length },
+        'Conversation indexing complete',
+      );
+    }
+  } catch (err) {
+    logger.error(
+      { groupFolder, err },
+      'Failed to scan conversations directory',
+    );
+  }
+
+  return indexedCount;
+}
+
+/**
+ * Search conversations using FTS5 full-text search.
+ * Returns matching results with filename, date, and content snippet.
+ */
+export function searchConversations(
+  groupFolder: string,
+  query: string,
+  limit: number = 3,
+): ConversationSearchResult[] {
+  if (!isValidGroupFolder(groupFolder)) {
+    logger.warn(
+      { groupFolder },
+      'Invalid group folder for conversation search',
+    );
+    return [];
+  }
+
+  if (!query || query.trim().length === 0) {
+    return [];
+  }
+
+  try {
+    // FTS5 search with snippet for context
+    // snippet() returns ~64 chars around matched terms with <b> tags
+    const sql = `
+      SELECT
+        c.filename,
+        c.date,
+        snippet(conversations_fts, -1, '', '', '...', 20) as snippet
+      FROM conversations c
+      INNER JOIN conversations_fts fts ON c.id = fts.rowid
+      WHERE c.group_folder = ?
+        AND conversations_fts MATCH ?
+      ORDER BY c.date DESC
+      LIMIT ?
+    `;
+
+    const rows = db.prepare(sql).all(groupFolder, query, limit) as Array<{
+      filename: string;
+      date: string | null;
+      snippet: string;
+    }>;
+
+    // Clean up snippet: remove FTS5 markup tags
+    return rows.map((row) => ({
+      filename: row.filename,
+      date: row.date,
+      snippet: row.snippet.replace(/<b>|<\/b>/g, ''),
+    }));
+  } catch (err) {
+    logger.error({ groupFolder, query, err }, 'Conversation search failed');
+    return [];
+  }
 }
 
 // --- JSON migration ---

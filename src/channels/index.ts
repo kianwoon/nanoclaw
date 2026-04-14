@@ -8,5 +8,7 @@
 // slack
 
 // telegram
+import './telegram.js';
 
-// whatsapp
+// whatsapp (temporarily disabled — re-enable with /add-whatsapp)
+// import './whatsapp.js';

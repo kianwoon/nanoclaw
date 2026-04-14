@@ -5,7 +5,13 @@ import { CronExpressionParser } from 'cron-parser';
 
 import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
 import { AvailableGroup } from './container-runner.js';
-import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
+import {
+  createTask,
+  deleteTask,
+  getTaskById,
+  updateTask,
+  searchConversations,
+} from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
@@ -22,6 +28,7 @@ export interface IpcDeps {
     availableGroups: AvailableGroup[],
     registeredJids: Set<string>,
   ) => void;
+  onTasksChanged: () => void;
 }
 
 let ipcWatcherRunning = false;
@@ -144,6 +151,108 @@ export function startIpcWatcher(deps: IpcDeps): void {
       } catch (err) {
         logger.error({ err, sourceGroup }, 'Error reading IPC tasks directory');
       }
+
+      // Process session search requests from this group's IPC directory
+      const searchRequestsDir = path.join(
+        ipcBaseDir,
+        sourceGroup,
+        'search-requests',
+      );
+      const searchResponsesDir = path.join(
+        ipcBaseDir,
+        sourceGroup,
+        'search-responses',
+      );
+
+      try {
+        if (fs.existsSync(searchRequestsDir)) {
+          // Create responses dir only if there are requests to process
+          if (!fs.existsSync(searchResponsesDir)) {
+            fs.mkdirSync(searchResponsesDir, { recursive: true });
+          }
+
+          const requestFiles = fs
+            .readdirSync(searchRequestsDir)
+            .filter((f) => f.endsWith('.json'));
+          for (const file of requestFiles) {
+            const filePath = path.join(searchRequestsDir, file);
+            try {
+              const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+
+              if (
+                data.type === 'session_search' &&
+                data.request_id &&
+                data.query
+              ) {
+                // Perform search
+                const limit = data.limit || 3;
+                const results = searchConversations(
+                  sourceGroup,
+                  data.query,
+                  limit,
+                );
+
+                // Write response
+                const responseData = {
+                  request_id: data.request_id,
+                  results,
+                  timestamp: new Date().toISOString(),
+                };
+
+                const responsePath = path.join(
+                  searchResponsesDir,
+                  `${data.request_id}.json`,
+                );
+
+                // Atomic write
+                const tempPath = `${responsePath}.tmp`;
+                fs.writeFileSync(
+                  tempPath,
+                  JSON.stringify(responseData, null, 2),
+                );
+                fs.renameSync(tempPath, responsePath);
+
+                logger.info(
+                  {
+                    sourceGroup,
+                    requestId: data.request_id,
+                    query: data.query,
+                    resultCount: results.length,
+                  },
+                  'Session search completed via IPC',
+                );
+              }
+
+              // Clean up request file
+              fs.unlinkSync(filePath);
+            } catch (err) {
+              // Handle ENOENT gracefully (file disappeared between readdir and read)
+              if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+                logger.debug(
+                  { file, sourceGroup },
+                  'Search request file disappeared before processing',
+                );
+                continue;
+              }
+              logger.error(
+                { file, sourceGroup, err },
+                'Error processing session search request',
+              );
+              const errorDir = path.join(ipcBaseDir, 'errors');
+              fs.mkdirSync(errorDir, { recursive: true });
+              fs.renameSync(
+                filePath,
+                path.join(errorDir, `${sourceGroup}-${file}`),
+              );
+            }
+          }
+        }
+      } catch (err) {
+        logger.error(
+          { err, sourceGroup },
+          'Error reading search requests directory',
+        );
+      }
     }
 
     setTimeout(processIpcFiles, IPC_POLL_INTERVAL);
@@ -161,6 +270,7 @@ export async function processTaskIpc(
     schedule_type?: string;
     schedule_value?: string;
     context_mode?: string;
+    script?: string;
     groupFolder?: string;
     chatJid?: string;
     targetJid?: string;
@@ -259,6 +369,7 @@ export async function processTaskIpc(
           group_folder: targetFolder,
           chat_jid: targetJid,
           prompt: data.prompt,
+          script: data.script || null,
           schedule_type: scheduleType,
           schedule_value: data.schedule_value,
           context_mode: contextMode,
@@ -270,6 +381,7 @@ export async function processTaskIpc(
           { taskId, sourceGroup, targetFolder, contextMode },
           'Task created via IPC',
         );
+        deps.onTasksChanged();
       }
       break;
 
@@ -282,6 +394,7 @@ export async function processTaskIpc(
             { taskId: data.taskId, sourceGroup },
             'Task paused via IPC',
           );
+          deps.onTasksChanged();
         } else {
           logger.warn(
             { taskId: data.taskId, sourceGroup },
@@ -300,6 +413,7 @@ export async function processTaskIpc(
             { taskId: data.taskId, sourceGroup },
             'Task resumed via IPC',
           );
+          deps.onTasksChanged();
         } else {
           logger.warn(
             { taskId: data.taskId, sourceGroup },
@@ -318,6 +432,7 @@ export async function processTaskIpc(
             { taskId: data.taskId, sourceGroup },
             'Task cancelled via IPC',
           );
+          deps.onTasksChanged();
         } else {
           logger.warn(
             { taskId: data.taskId, sourceGroup },
@@ -347,6 +462,7 @@ export async function processTaskIpc(
 
         const updates: Parameters<typeof updateTask>[1] = {};
         if (data.prompt !== undefined) updates.prompt = data.prompt;
+        if (data.script !== undefined) updates.script = data.script || null;
         if (data.schedule_type !== undefined)
           updates.schedule_type = data.schedule_type as
             | 'cron'
@@ -388,6 +504,7 @@ export async function processTaskIpc(
           { taskId: data.taskId, sourceGroup, updates },
           'Task updated via IPC',
         );
+        deps.onTasksChanged();
       }
       break;
 
@@ -432,7 +549,10 @@ export async function processTaskIpc(
           );
           break;
         }
-        // Defense in depth: agent cannot set isMain via IPC
+        // Defense in depth: agent cannot set isMain via IPC.
+        // Preserve isMain from the existing registration so IPC config
+        // updates (e.g. adding additionalMounts) don't strip the flag.
+        const existingGroup = registeredGroups[data.jid];
         deps.registerGroup(data.jid, {
           name: data.name,
           folder: data.folder,
@@ -440,6 +560,7 @@ export async function processTaskIpc(
           added_at: new Date().toISOString(),
           containerConfig: data.containerConfig,
           requiresTrigger: data.requiresTrigger,
+          isMain: existingGroup?.isMain,
         });
       } else {
         logger.warn(
